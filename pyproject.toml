@@ -1,0 +1,15 @@
+# pyproject.toml
+[project]
+name = "ComfyUI-FFmpeg-Video"
+description = "Comfyui custom nodes to handle video concatenation with FFmpeg"
+version = "0.0.1"
+license = { file = "LICENSE.txt" }
+dependencies  = [] 
+
+[project.urls]
+Repository = "https://github.com/bbaudio-2025/ComfyUI-FFmpeg-Video"
+
+[tool.comfy]
+PublisherId = "bbaudio" 
+DisplayName = "ComfyUI-FFmpeg-Video" 
+Icon = ""
