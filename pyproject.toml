@@ -2,7 +2,7 @@
 [project]
 name = "ComfyUI-FFmpeg-Video"
 description = "Comfyui custom nodes to handle video concatenation with FFmpeg"
-version = "0.0.1"
+version = "0.0.2"
 license = { file = "LICENSE.txt" }
 dependencies  = [] 
 
