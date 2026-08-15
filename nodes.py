@@ -18,6 +18,10 @@ Node 3 — VideoExtractSegment
     Extract a segment of frames (as IMAGE tensor) and corresponding
     audio from a video.  Frame-accurate positioning via FFmpeg.
     Returns silent audio if the video has no audio track.
+
+Node 4 — VideoInfo
+    Inspect a video and return its technical metadata (dimensions,
+    frame rate, duration, frame count, codecs, bitrates, audio specs).
 """
 
 import os
@@ -32,6 +36,7 @@ from .video_utils import (
     get_video_path,
     get_video_info,
     get_audio_info,
+    get_video_details,
     get_video_audio_info,
     extract_frames,
     extract_audio_segment,
@@ -581,3 +586,66 @@ class VideoExtractSegment:
         )
 
         return (images, audio)
+
+
+# ===================================================================
+# Node 4 — Video Information
+# ===================================================================
+
+class VideoInfo:
+    """Inspect a video and return its technical metadata."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": (
+                    "VIDEO",
+                    {"tooltip": "The video to inspect."},
+                ),
+            }
+        }
+
+    RETURN_TYPES = (
+        "INT", "INT", "FLOAT", "FLOAT", "INT",
+        "STRING", "INT",
+        "INT", "INT", "INT", "STRING", "INT",
+    )
+    RETURN_NAMES = (
+        "width", "height", "fps", "duration", "frame_count",
+        "video_codec", "video_bitrate_kbps",
+        "audio_channels", "audio_sample_rate", "audio_bit_depth",
+        "audio_codec", "audio_bitrate_kbps",
+    )
+    FUNCTION = "inspect"
+    CATEGORY = "FFmpeg Video"
+    DESCRIPTION = (
+        "Inspect a video file and return its technical metadata: "
+        "dimensions, frame rate, duration, frame count, video codec and "
+        "average bitrate, plus audio channel count, sample rate, bit "
+        "depth, codec and average bitrate.  Audio fields are 0 / empty "
+        "when the video has no audio track."
+    )
+
+    # ------------------------------------------------------------------
+
+    def inspect(self, video):
+        check_ffmpeg()
+
+        video_path = get_video_path(video)
+        info = get_video_details(video_path)
+
+        return (
+            info["width"],
+            info["height"],
+            info["fps"],
+            info["duration"],
+            info["frame_count"],
+            info["video_codec"],
+            info["video_bitrate_kbps"],
+            info["audio_channels"],
+            info["audio_sample_rate"],
+            info["audio_bit_depth"],
+            info["audio_codec"],
+            info["audio_bitrate_kbps"],
+        )
