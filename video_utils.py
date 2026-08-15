@@ -206,6 +206,170 @@ def get_audio_info(audio_path):
     }
 
 
+def _bitrate_kbps(bit_rate):
+    """Convert an ffprobe bit-rate string (bps) to integer kB/s."""
+    if not bit_rate:
+        return 0
+    try:
+        return int(float(bit_rate) / 1000)
+    except (TypeError, ValueError):
+        return 0
+
+
+_INTEGER_SAMPLE_FORMAT_BITS = {
+    "u8": 8,
+    "u8p": 8,
+    "s16": 16,
+    "s16p": 16,
+    "s24": 24,
+    "s24p": 24,
+    "s32": 32,
+    "s32p": 32,
+    "s64": 64,
+    "s64p": 64,
+}
+
+_LOSSY_CODEC_BIT_DEPTHS = {
+    "aac": 16,
+    "aac_latm": 16,
+    "mp3": 16,
+    "mp2": 16,
+    "opus": 16,
+    "vorbis": 16,
+    "ac3": 16,
+    "eac3": 16,
+    "wmav2": 16,
+    "amr_nb": 16,
+    "amr_wb": 16,
+    "speex": 16,
+    "cook": 16,
+}
+
+
+def _audio_bit_depth(stream):
+    """
+    Best-effort estimate of an audio stream's bit depth.
+
+    1. Use the exact per-sample values ffprobe reports for PCM / FLAC /
+       other lossless codecs (``bits_per_raw_sample`` / ``bits_per_sample``).
+    2. Fall back to the integer ``sample_fmt`` when available.
+    3. For lossy codecs (AAC, MP3, Opus, ...) no bit depth is stored in
+       the file, so report their conventional source depth (16-bit);
+       ffprobe's decoded ``sample_fmt`` (e.g. ``fltp`` = float32) is a
+       decoder output and would be misleading.
+
+    Returns ``0`` when nothing usable is found.
+    """
+    for key in ("bits_per_raw_sample", "bits_per_sample"):
+        value = stream.get(key)
+        if value in (None, "", "N/A"):
+            continue
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+
+    sample_fmt = stream.get("sample_fmt", "")
+    if sample_fmt in _INTEGER_SAMPLE_FORMAT_BITS:
+        return _INTEGER_SAMPLE_FORMAT_BITS[sample_fmt]
+
+    codec = stream.get("codec_name", "")
+    return _LOSSY_CODEC_BIT_DEPTHS.get(codec, 0)
+
+
+def get_video_details(video_path):
+    """
+    Probe a video file and return detailed metadata about its video and
+    audio streams.
+
+    Returns
+    -------
+    dict
+        width, height, fps, duration, frame_count, video_codec,
+        video_bitrate_kbps, audio_channels, audio_sample_rate,
+        audio_bit_depth, audio_codec, audio_bitrate_kbps.
+
+        When the file has no audio stream, the ``audio_*`` fields are
+        ``0`` / empty strings.  Bitrates are averaged over the whole
+        file in kB/s (kilobits per second).
+    """
+    probe = ffmpeg.probe(video_path)
+
+    video_stream = None
+    audio_stream = None
+    for stream in probe.get("streams", []):
+        ctype = stream.get("codec_type")
+        if ctype == "video" and video_stream is None:
+            video_stream = stream
+        elif ctype == "audio" and audio_stream is None:
+            audio_stream = stream
+        if video_stream is not None and audio_stream is not None:
+            break
+
+    if video_stream is None:
+        raise ValueError(f"No video stream found in: {video_path}")
+
+    fps = _parse_frame_rate(video_stream.get("r_frame_rate", "0/1"))
+    duration = float(
+        video_stream.get("duration")
+        or probe.get("format", {}).get("duration", 0)
+    )
+
+    frame_count = int(video_stream.get("nb_frames", 0))
+    if frame_count == 0 and fps > 0 and duration > 0:
+        frame_count = int(round(duration * fps))
+
+    # --- video bitrate --------------------------------------------------
+    # Prefer the per-stream bit_rate; fall back to the container total
+    # (minus the audio bitrate when one is present).
+    format_info = probe.get("format", {})
+    video_bitrate = video_stream.get("bit_rate")
+    if not video_bitrate and format_info.get("bit_rate"):
+        total_bitrate = format_info["bit_rate"]
+        audio_bitrate = audio_stream.get("bit_rate") if audio_stream else None
+        if audio_bitrate:
+            try:
+                video_bitrate = str(
+                    max(0, int(float(total_bitrate)) - int(float(audio_bitrate)))
+                )
+            except (TypeError, ValueError):
+                video_bitrate = total_bitrate
+        else:
+            video_bitrate = total_bitrate
+
+    # --- audio fields ----------------------------------------------------
+    has_audio = audio_stream is not None
+    audio_channels = 0
+    audio_sample_rate = 0
+    audio_bit_depth = 0
+    audio_codec = ""
+    audio_bitrate_kbps = 0
+
+    if has_audio:
+        audio_channels = int(audio_stream.get("channels", 0))
+        audio_sample_rate = int(audio_stream.get("sample_rate", 0))
+        audio_bit_depth = _audio_bit_depth(audio_stream)
+        audio_codec = audio_stream.get("codec_name", "unknown")
+        audio_bitrate_kbps = _bitrate_kbps(audio_stream.get("bit_rate"))
+
+    return {
+        "width": int(video_stream["width"]),
+        "height": int(video_stream["height"]),
+        "fps": fps,
+        "duration": duration,
+        "frame_count": frame_count,
+        "video_codec": video_stream.get("codec_name", "unknown"),
+        "video_bitrate_kbps": _bitrate_kbps(video_bitrate),
+        "audio_channels": audio_channels,
+        "audio_sample_rate": audio_sample_rate,
+        "audio_bit_depth": audio_bit_depth,
+        "audio_codec": audio_codec,
+        "audio_bitrate_kbps": audio_bitrate_kbps,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Audio save (AUDIO type -> WAV)
 # ---------------------------------------------------------------------------
