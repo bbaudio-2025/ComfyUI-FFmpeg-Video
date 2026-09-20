@@ -22,6 +22,12 @@ Node 3 — VideoExtractSegment
 Node 4 — VideoInfo
     Inspect a video and return its technical metadata (dimensions,
     frame rate, duration, frame count, codecs, bitrates, audio specs).
+
+Node 5 — VideoResize
+    Resize a video, mirroring KJNodes' ImageResizeKJv2 options
+    (stretch / resize / crop / pad / pad_edge / pad_edge_pixel /
+    pillarbox_blur / total_pixels + crop_position).  Video and audio
+    streams are processed by FFmpeg filters only — no frame tensors.
 """
 
 import os
@@ -43,6 +49,8 @@ from .video_utils import (
     get_temp_path,
     save_audio_to_wav,
     create_video_output,
+    build_resize_graph,
+    resolve_video,
     _channel_layout_name,
 )
 
@@ -649,3 +657,229 @@ class VideoInfo:
             info["audio_codec"],
             info["audio_bitrate_kbps"],
         )
+
+
+# ===================================================================
+# Node 5 — Video Resize
+# ===================================================================
+
+class VideoResize:
+    """Resize a video with FFmpeg stream filters (KJNodes-like options)."""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "video": (
+                    "VIDEO",
+                    {"tooltip": "The video to resize."},
+                ),
+                "width": (
+                    "INT",
+                    {
+                        "default": 512,
+                        "min": 0,
+                        "max": 16384,
+                        "step": 1,
+                        "tooltip": "Target width in pixels (0 = keep the source width). "
+                                   "For the aspect-preserving modes this is a bounding box.",
+                    },
+                ),
+                "height": (
+                    "INT",
+                    {
+                        "default": 512,
+                        "min": 0,
+                        "max": 16384,
+                        "step": 1,
+                        "tooltip": "Target height in pixels (0 = keep the source height). "
+                                   "For the aspect-preserving modes this is a bounding box.",
+                    },
+                ),
+                "upscale_method": (
+                    [
+                        "nearest-exact",
+                        "bilinear",
+                        "area",
+                        "bicubic",
+                        "lanczos",
+                    ],
+                    {
+                        "default": "lanczos",
+                        "tooltip": "Scaling interpolation — mapped to the FFmpeg "
+                                   "scale filter: nearest-exact -> neighbor, "
+                                   "bilinear, area, bicubic, lanczos.",
+                    },
+                ),
+                "keep_proportion": (
+                    [
+                        "stretch",
+                        "resize",
+                        "crop",
+                        "total_pixels",
+                        "pad",
+                        "pad_edge",
+                        "pad_edge_pixel",
+                        "pillarbox_blur",
+                    ],
+                    {
+                        "default": "resize",
+                        "tooltip": (
+                            "stretch: force width x height, aspect ratio ignored. "
+                            "resize: scale to fit inside width x height, aspect kept. "
+                            "crop: crop to the width/height aspect ratio (crop_position), then scale. "
+                            "total_pixels: scale so that w*h == width*height, aspect kept. "
+                            "pad: fit + pad with pad_color. "
+                            "pad_edge: fit + pad, border = mean colour of each edge line. "
+                            "pad_edge_pixel: fit + pad, border = nearest edge pixels. "
+                            "pillarbox_blur: fit + pad, border = blurred/dimmed cover frame."
+                        ),
+                    },
+                ),
+                "pad_color": (
+                    "STRING",
+                    {
+                        "default": "0, 0, 0",
+                        "tooltip": "Padding colour for the 'pad' mode: '0, 0, 0' (0-255), "
+                                   "'0.0, 0.0, 0.0' (0-1), a colour name or '#rrggbb'.",
+                    },
+                ),
+                "crop_position": (
+                    [
+                        "center",
+                        "top",
+                        "bottom",
+                        "left",
+                        "right",
+                    ],
+                    {
+                        "default": "center",
+                        "tooltip": "Where to crop from, and where to align the image "
+                                   "inside the padded area.",
+                    },
+                ),
+                "divisible_by": (
+                    "INT",
+                    {
+                        "default": 2,
+                        "min": 0,
+                        "max": 512,
+                        "step": 1,
+                        "tooltip": "Width/height are rounded down to a multiple of this value. "
+                                   "yuv420p needs even dimensions, so values below 2 are "
+                                   "treated as 2.",
+                    },
+                ),
+            }
+        }
+
+    RETURN_TYPES = ("VIDEO",)
+    RETURN_NAMES = ("video",)
+    FUNCTION = "resize"
+    CATEGORY = "FFmpeg Video"
+    DESCRIPTION = (
+        "Resize a video (and keep its audio) using FFmpeg stream filters, so "
+        "memory usage stays flat regardless of resolution or frame count. "
+        "The keep_proportion options mirror KJNodes' Resize Image v2 node. "
+        "If the requested size equals the source size and no crop/pad is "
+        "needed, the video stream is copied without re-encoding."
+    )
+
+    # ------------------------------------------------------------------
+
+    def resize(self, video, width, height, upscale_method, keep_proportion,
+               pad_color, crop_position, divisible_by):
+        check_ffmpeg()
+
+        # --- resolve the video file + lazy trim window -------------------
+        # "Crop Video (Temporal)" and similar ComfyUI nodes are fully lazy:
+        # they keep the original file and only record a trim offset
+        # (start_time/duration). Honour it, otherwise re-encoding the whole
+        # file would silently drop the temporal crop.
+        video_path, start_time, duration = resolve_video(video)
+        info = get_video_info(video_path)
+        src_w = info["width"]
+        src_h = info["height"]
+
+        has_audio, _audio_sr, _audio_ch = get_video_audio_info(video_path)
+
+        # --- build the filter graph -----------------------------------
+        # Seek to the lazy-trim start at the *input* level so that both the
+        # video and audio streams are aligned to the cropped window.
+        video_input_kwargs = {}
+        if start_time > 0:
+            video_input_kwargs["ss"] = start_time
+        video_input = ffmpeg.input(video_path, **video_input_kwargs)
+
+        stream, out_w, out_h, changed = build_resize_graph(
+            video_input.video,
+            src_w,
+            src_h,
+            width,
+            height,
+            upscale_method=upscale_method,
+            keep_proportion=keep_proportion,
+            crop_position=crop_position,
+            pad_color=pad_color,
+            divisible_by=divisible_by,
+        )
+
+        output_path = get_temp_path(".mp4")
+
+        # Anamorphic sources (SAR != 1:1) would look distorted after a plain
+        # scale, so reset the pixel aspect ratio to square pixels.
+        sar = str(info.get("sar") or "1:1")
+        if changed and sar not in ("1:1", "N/A", "0:1", ""):
+            stream = ffmpeg.filter(stream, "setsar", 1)
+
+        # --- assemble the output spec ---------------------------------
+        # "copy" keeps the source audio untouched; it is retried with AAC
+        # in case the source codec cannot be stored in an MP4 container.
+        out_args = {}
+        if duration > 0:
+            out_args["t"] = duration
+
+        def _spec(acodec):
+            if changed:
+                spec = ffmpeg.output(
+                    stream,
+                    *([video_input.audio] if has_audio else []),
+                    output_path,
+                    vcodec="libx264",
+                    preset="medium",
+                    crf=18,
+                    pix_fmt="yuv420p",
+                    acodec=acodec,
+                    **out_args,
+                )
+            else:
+                # Nothing to do geometry-wise: remux without re-encoding.
+                spec = ffmpeg.output(
+                    video_input,
+                    output_path,
+                    vcodec="copy",
+                    acodec=acodec,
+                    **out_args,
+                )
+            return spec
+
+        specs = [_spec("copy"), _spec("aac")] if has_audio else [_spec("aac")]
+
+        last_error = None
+        for spec in specs:
+            try:
+                ffmpeg.run(spec, overwrite_output=True, capture_stderr=True)
+                last_error = None
+                break
+            except ffmpeg.Error as exc:
+                last_error = exc
+
+        if last_error is not None:
+            stderr = (
+                last_error.stderr.decode("utf-8", errors="replace")
+                if last_error.stderr
+                else str(last_error)
+            )
+            raise RuntimeError(f"FFmpeg resize failed:\n{stderr}")
+
+        return (create_video_output(output_path),)
